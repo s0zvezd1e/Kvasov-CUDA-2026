@@ -1,0 +1,14 @@
+# Скомпилированные объектные файлы
+*.o
+*.mod
+
+# Исполняемые файлы
+transpose_program
+speed_test
+benchmark_full
+test_*
+cuda_matrix_random
+
+# Временные файлы
+*.save
+*.swp

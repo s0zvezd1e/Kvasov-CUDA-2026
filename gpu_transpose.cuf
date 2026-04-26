@@ -6,8 +6,7 @@ module gpu_transpose
 
 contains
 
-    ! Простое наивное ядро (как в тесте, но параллельное)
-    attributes(global) subroutine naive_transpose_kernel(a, b, rows, cols)
+    attributes(global) subroutine naive_kernel(a, b, rows, cols)
         real, device, intent(in)  :: a(:,:)
         real, device, intent(out) :: b(:,:)
         integer, value, intent(in) :: rows, cols
@@ -19,7 +18,7 @@ contains
         if (i <= rows .and. j <= cols) then
             b(j, i) = a(i, j)
         end if
-    end subroutine naive_transpose_kernel
+    end subroutine naive_kernel
 
     subroutine transpose_gpu(a, b, block_dim)
         real, intent(in)  :: a(:,:)
@@ -33,24 +32,14 @@ contains
         cols = size(a, 2)
         
         allocate(a_d(rows, cols), b_d(cols, rows), stat=istat)
-        if (istat /= 0) then
-            print *, 'GPU memory allocation error'
-            return
-        end if
+        if (istat /= 0) return
         
-        ! Копируем данные на GPU
         a_d = a
         
-        ! Настройка сетки (блоки и потоки)
         block = dim3(block_dim, block_dim, 1)
-        grid = dim3(ceiling(real(rows)/block_dim), ceiling(real(cols)/block_dim), 1)
+        grid = dim3((rows + block_dim - 1) / block_dim, (cols + block_dim - 1) / block_dim, 1)
         
-        print *, 'Grid:', grid%x, 'x', grid%y, '  Block:', block%x, 'x', block%y
-        
-        ! Запускаем ядро
-        call naive_transpose_kernel<<<grid, block>>>(a_d, b_d, rows, cols)
-        
-        ! Синхронизация и копирование результата
+        call naive_kernel<<<grid, block>>>(a_d, b_d, rows, cols)
         istat = cudaDeviceSynchronize()
         b = b_d
         

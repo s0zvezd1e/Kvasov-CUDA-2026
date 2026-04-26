@@ -1,10 +1,8 @@
 program main
-
     use cudafor
     use utils_module
-    use mat_transpose_module
+    use gpu_transpose
     use mat_transpose_cpu_module
-
     implicit none
 
     integer, parameter :: N_ROWS = 1024
@@ -25,7 +23,7 @@ program main
 
     call rnd_fill(a)
 
-    call mat_transpose_gpu(a, b_gpu, BLOCK_DIM)
+    call transpose_gpu(a, b_gpu, BLOCK_DIM)
     call mat_transpose_cpu(a, b_cpu)
 
     ra = min(K_PREVIEW, N_ROWS)
@@ -36,16 +34,15 @@ program main
     call print_corner('B (GPU)', b_gpu, ca, ra)
 
     if (check_equal_mat(b_gpu, b_cpu)) then
-        print *, 'Transpose arrays are equal'
+        print *, '✓ Transpose arrays are equal'
     else
-        print *, 'Transpose arrays are not equal'
+        print *, '✗ Transpose arrays are not equal'
     end if
 
     deallocate(a, b_gpu, b_cpu)
 
 contains
 
-    ! Печать левого верхнего угла матрицы для быстрой визуальной проверки.
     subroutine print_corner(title, x, nrows, ncols)
         character(*), intent(in) :: title
         real,         intent(in) :: x(:,:)
