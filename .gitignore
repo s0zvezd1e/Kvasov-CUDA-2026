@@ -1,0 +1,34 @@
+# Скомпилированные файлы
+*.o
+*.mod
+*.exe
+*.out
+
+# Исполняемые файлы
+test_1
+test_2
+cuda_matrix_add_random
+cuda_matrix_random
+transpose_program
+speed_test
+gemm_test
+gemm_streams
+matrix_add_interactive
+
+# Системные файлы
+.bash_history
+.viminfo
+.screenrc
+.lesshst
+*.save
+
+# Папки с системными файлами
+.cache/
+.config/
+.local/
+.ssh/
+.nv/
+
+# Временные файлы
+*.swp
+*~
