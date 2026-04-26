@@ -1,3 +1,21 @@
+! ================================================================
+! GPU ТРАНСПОНИРОВАНИЕ МАТРИЦЫ (CUDA FORTRAN)
+! ================================================================
+! 
+! КЛЮЧЕВЫЕ ПОНЯТИЯ CUDA:
+!   - KERNEL (ЯДРО)     = функция, которая выполняется на GPU
+!   - THREAD (ПОТОК)    = один исполнитель на GPU (тысячи одновременно)
+!   - BLOCK (БЛОК)      = группа потоков (обычно 16x16 = 256 потоков)
+!   - GRID (СЕТКА)      = группа блоков (покрывает всю матрицу)
+!
+! ПРИНЦИП РАБОТЫ:
+!   1. Каждый поток обрабатывает ОДИН элемент матрицы
+!   2. Поток определяет свои глобальные координаты (i, j)
+!   3. Поток читает a(i,j) из глобальной памяти
+!   4. Поток записывает b(j,i) (транспонированная позиция)
+!
+! ================================================================
+
 module gpu_transpose
     use cudafor
     implicit none
@@ -6,44 +24,66 @@ module gpu_transpose
 
 contains
 
+    ! ================================================================
+    ! ЯДРО ТРАНСПОНИРОВАНИЯ (ВЫПОЛНЯЕТСЯ НА GPU)
+    ! ================================================================
     attributes(global) subroutine naive_kernel(a, b, rows, cols)
         real, device, intent(in)  :: a(:,:)
         real, device, intent(out) :: b(:,:)
         integer, value, intent(in) :: rows, cols
+        
         integer :: i, j
         
+        ! Вычисление глобальных координат потока
         i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
         j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
         
+        ! Проверка границ (защита от выхода за пределы матрицы)
         if (i <= rows .and. j <= cols) then
+            ! Транспонирование: меняем индексы местами
             b(j, i) = a(i, j)
         end if
+        
     end subroutine naive_kernel
 
+    ! ================================================================
+    ! ХОСТ-ФУНКЦИЯ (ВЫЗЫВАЕТСЯ С CPU, ЗАПУСКАЕТ ЯДРО НА GPU)
+    ! ================================================================
     subroutine transpose_gpu(a, b, block_dim)
         real, intent(in)  :: a(:,:)
         real, intent(out) :: b(:,:)
         integer, intent(in) :: block_dim
+        
         real, device, allocatable :: a_d(:,:), b_d(:,:)
         integer :: rows, cols, istat
         type(dim3) :: grid, block
         
+        ! Определяем размеры матрицы
         rows = size(a, 1)
         cols = size(a, 2)
         
+        ! Выделяем память на GPU
         allocate(a_d(rows, cols), b_d(cols, rows), stat=istat)
-        if (istat /= 0) return
         
+        ! Копируем данные с CPU на GPU
         a_d = a
         
+        ! Настраиваем блоки и сетку
         block = dim3(block_dim, block_dim, 1)
-        grid = dim3((rows + block_dim - 1) / block_dim, (cols + block_dim - 1) / block_dim, 1)
+        grid = dim3(ceiling(real(rows)/block_dim), ceiling(real(cols)/block_dim), 1)
         
+        ! Запускаем ядро на GPU
         call naive_kernel<<<grid, block>>>(a_d, b_d, rows, cols)
+        
+        ! Синхронизация (ждём завершения GPU)
         istat = cudaDeviceSynchronize()
+        
+        ! Копируем результат обратно на CPU
         b = b_d
         
+        ! Освобождаем память на GPU
         deallocate(a_d, b_d)
+        
     end subroutine transpose_gpu
 
 end module gpu_transpose

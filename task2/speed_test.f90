@@ -1,47 +1,64 @@
+! ================================================================
+! ТЕСТ ПРОИЗВОДИТЕЛЬНОСТИ: CPU vs GPU
+! ================================================================
+!
+! Что делает:
+!   - умножает матрицы разных размеров
+!   - сравнивает время выполнения на CPU и GPU
+!   - считает ускорение (speedup)
+!
+! ================================================================
+
 program speed_test
     use utils_module
     use mat_transpose_cpu_module
     use gpu_transpose
     implicit none
-    integer, parameter :: sizes(4) = [512, 1024, 2048, 4096]
-    integer :: i, n, istat
-    real, allocatable :: a(:,:), b_cpu(:,:), b_gpu(:,:)
-    real :: t1, t2, time_cpu, time_gpu
     
-    print *, '============================================='
-    print *, '   Сравнение производительности CPU vs GPU'
-    print *, '============================================='
-    print *, 'Размер    | CPU время (с) | GPU время (с) | Ускорение'
-    print *, '----------|---------------|---------------|----------'
+    ! ------------------------------------------------------------
+    ! ПАРАМЕТРЫ
+    ! ------------------------------------------------------------
+    integer, parameter :: sizes(4) = [512, 1024, 2048, 4096]  ! размеры матриц
+    real :: start_t, end_t, time_cpu, time_gpu
     
+    print *, '===================================='
+    print *, 'Тест производительности CPU vs GPU'
+    print *, '===================================='
+    
+    ! ------------------------------------------------------------
+    ! ТЕСТИРУЕМ РАЗНЫЕ РАЗМЕРЫ
+    ! ------------------------------------------------------------
     do i = 1, size(sizes)
         n = sizes(i)
-        allocate(a(n, n), b_cpu(n, n), b_gpu(n, n), stat=istat)
-        if (istat /= 0) cycle
         
+        print *, 'Размер матрицы:', n, 'x', n
+        
+        allocate(a(n,n), b_cpu(n,n), b_gpu(n,n))
         call rnd_fill(a)
         
-        ! CPU замер
-        call cpu_time(t1)
+        ! --------------------------------------------------------
+        ! ЗАМЕР НА CPU
+        ! --------------------------------------------------------
+        call cpu_time(start_t)
         call mat_transpose_cpu(a, b_cpu)
-        call cpu_time(t2)
-        time_cpu = t2 - t1
+        call cpu_time(end_t)
+        time_cpu = end_t - start_t
         
-        ! GPU прогрев
+        ! --------------------------------------------------------
+        ! ЗАМЕР НА GPU
+        ! --------------------------------------------------------
+        call transpose_gpu(a, b_gpu, 16)      ! прогревочный запуск
+        call cpu_time(start_t)
         call transpose_gpu(a, b_gpu, 16)
+        call cpu_time(end_t)
+        time_gpu = end_t - start_t
         
-        ! GPU замер
-        call cpu_time(t1)
-        call transpose_gpu(a, b_gpu, 16)
-        call cpu_time(t2)
-        time_gpu = t2 - t1
-        
-        print '(i6, " | ", f12.6, " | ", f12.6, " | ", f8.2, "x")', n, time_cpu, time_gpu, time_cpu/time_gpu
+        print *, 'CPU время:', time_cpu, 'сек'
+        print *, 'GPU время:', time_gpu, 'сек'
+        print *, 'Ускорение:', time_cpu/time_gpu, 'x'
+        print *, ''
         
         deallocate(a, b_cpu, b_gpu)
     end do
     
-    print *, '============================================='
-    print *, 'Ускорение достигается на матрицах > 1024'
-    print *, '============================================='
 end program speed_test
