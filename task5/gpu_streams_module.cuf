@@ -1,0 +1,163 @@
+module gpu_streams_module
+    use cudafor
+    implicit none
+    private
+    public :: gemm_serial, gemm_concurrent
+
+    integer, parameter :: TILE = 32
+
+contains
+
+    subroutine cuda_check(istat, msg)
+        integer,          intent(in) :: istat
+        character(len=*), intent(in) :: msg
+        if (istat /= cudaSuccess) then
+            write(*,'(a,a,a,i0)') '[CUDA ERROR] ', msg, ' code=', istat
+            stop 1
+        end if
+    end subroutine cuda_check
+
+    attributes(global) subroutine gemm_kernel(a, b, c, m, n, k)
+        integer, value, intent(in) :: m, n, k
+        real(8), device, intent(in)  :: a(m,k), b(k,n)
+        real(8), device, intent(out) :: c(m,n)
+        integer :: i, j, p
+        real(8) :: acc
+        
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        
+        if (i <= m .and. j <= n) then
+            acc = 0.d0
+            do p = 1, k
+                acc = acc + a(i, p) * b(p, j)
+            end do
+            c(i, j) = acc
+        end if
+    end subroutine gemm_kernel
+
+    ! Последовательная версия - просто умножаем всё сразу
+    subroutine gemm_serial(h_A, h_B, h_C, nstreams, t_ms)
+        real(8), intent(in)    :: h_A(:,:)
+        real(8), intent(in)    :: h_B(:,:)
+        real(8), intent(out)   :: h_C(:,:)
+        integer, intent(in)    :: nstreams
+        real,    intent(out)   :: t_ms
+
+        integer :: M, N, K
+        real(8), device, allocatable :: d_A(:,:), d_B(:,:), d_C(:,:)
+        type(dim3) :: grid, block
+        type(cudaEvent) :: ev_start, ev_stop
+        integer :: istat
+
+        M = size(h_A, 1)
+        N = size(h_A, 2)
+        K = size(h_B, 2)
+
+        allocate(d_A(M, N), d_B(N, K), d_C(M, K), stat=istat)
+        if (istat /= 0) stop 'serial: allocation failed'
+
+        block = dim3(TILE, TILE, 1)
+        grid = dim3((M+TILE-1)/TILE, (K+TILE-1)/TILE, 1)
+
+        call cuda_check(cudaEventCreate(ev_start), 'serial ev_start')
+        call cuda_check(cudaEventCreate(ev_stop), 'serial ev_stop')
+
+        d_A = h_A
+        d_B = h_B
+
+        call cuda_check(cudaEventRecord(ev_start, 0), 'serial start')
+        call gemm_kernel<<<grid, block>>>(d_A, d_B, d_C, M, K, N)
+        call cuda_check(cudaDeviceSynchronize(), 'serial kernel')
+        h_C = d_C
+        call cuda_check(cudaEventRecord(ev_stop, 0), 'serial stop')
+        call cuda_check(cudaEventSynchronize(ev_stop), 'serial sync')
+        call cuda_check(cudaEventElapsedTime(t_ms, ev_start, ev_stop), 'serial elapsed')
+
+        call cuda_check(cudaEventDestroy(ev_start), 'serial destroy start')
+        call cuda_check(cudaEventDestroy(ev_stop), 'serial destroy stop')
+        deallocate(d_A, d_B, d_C)
+    end subroutine gemm_serial
+
+    ! Конкурентная версия - разбиваем B по столбцам, каждый поток (stream) работает со своей частью
+    subroutine gemm_concurrent(h_A, h_B, h_C, nstreams, t_ms)
+        real(8), intent(in)    :: h_A(:,:)
+        real(8), intent(in)    :: h_B(:,:)
+        real(8), intent(out)   :: h_C(:,:)
+        integer, intent(in)    :: nstreams
+        real,    intent(out)   :: t_ms
+
+        integer :: M, N, K
+        integer :: istream, szpart, shift
+        integer(cuda_stream_kind), allocatable :: stream(:)
+        real(8), device, allocatable :: d_A(:,:)
+        real(8), device, allocatable :: d_B(:,:), d_C(:,:)
+        type(dim3) :: grid, block
+        type(cudaEvent) :: ev_start, ev_stop
+        integer :: szpart_max, istat
+
+        M = size(h_A, 1)
+        N = size(h_A, 2)
+        K = size(h_B, 2)
+        szpart_max = (K + nstreams - 1) / nstreams
+
+        allocate(stream(0:nstreams-1), stat=istat)
+        if (istat /= 0) stop 'concurrent: stream allocation failed'
+
+        do istream = 0, nstreams - 1
+            call cuda_check(cudaStreamCreate(stream(istream)), 'streamCreate')
+        end do
+
+        allocate(d_A(M, N), stat=istat)
+        if (istat /= 0) stop 'concurrent: d_A allocation failed'
+        allocate(d_B(N, szpart_max), stat=istat)
+        if (istat /= 0) stop 'concurrent: d_B allocation failed'
+        allocate(d_C(M, szpart_max), stat=istat)
+        if (istat /= 0) stop 'concurrent: d_C allocation failed'
+
+        block = dim3(TILE, TILE, 1)
+        grid = dim3((M+TILE-1)/TILE, (szpart_max+TILE-1)/TILE, 1)
+
+        call cuda_check(cudaEventCreate(ev_start), 'concurrent ev_start')
+        call cuda_check(cudaEventCreate(ev_stop), 'concurrent ev_stop')
+
+        ! Копируем A (общая для всех)
+        d_A = h_A
+        call cuda_check(cudaDeviceSynchronize(), 'concurrent A copy')
+
+        call cuda_check(cudaEventRecord(ev_start, 0), 'concurrent start')
+
+        do istream = 0, nstreams - 1
+            szpart = K / nstreams
+            if (istream == nstreams - 1) szpart = szpart + mod(K, nstreams)
+            shift = (K / nstreams) * istream
+
+            ! Копируем свою часть B
+            d_B(1:N, 1:szpart) = h_B(1:N, shift+1 : shift+szpart)
+            call cuda_check(cudaStreamSynchronize(stream(istream)), 'B copy sync')
+
+            ! Запускаем ядро в своём потоке
+            call gemm_kernel<<<grid, block, 0, stream(istream)>>>(d_A, d_B, d_C, M, szpart, N)
+
+            ! Копируем результат обратно
+            h_C(1:M, shift+1 : shift+szpart) = d_C(1:M, 1:szpart)
+            call cuda_check(cudaStreamSynchronize(stream(istream)), 'result copy sync')
+        end do
+
+        call cuda_check(cudaDeviceSynchronize(), 'concurrent sync')
+
+        call cuda_check(cudaEventRecord(ev_stop, 0), 'concurrent stop')
+        call cuda_check(cudaEventSynchronize(ev_stop), 'concurrent sync')
+        call cuda_check(cudaEventElapsedTime(t_ms, ev_start, ev_stop), 'concurrent elapsed')
+
+        call cuda_check(cudaEventDestroy(ev_start), 'concurrent destroy start')
+        call cuda_check(cudaEventDestroy(ev_stop), 'concurrent destroy stop')
+
+        do istream = 0, nstreams - 1
+            call cuda_check(cudaStreamDestroy(stream(istream)), 'streamDestroy')
+        end do
+
+        deallocate(stream, d_A, d_B, d_C)
+    end subroutine gemm_concurrent
+
+end module gpu_streams_module
