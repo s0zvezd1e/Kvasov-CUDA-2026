@@ -1,0 +1,6 @@
+*.o
+*.mod
+*.exe
+debug_*
+test_*
+transpose_test
