@@ -1,0 +1,60 @@
+module gpu_transpose
+    use cudafor
+    implicit none
+    private
+    public :: transpose_gpu
+
+contains
+
+    ! Простое наивное ядро (как в тесте, но параллельное)
+    attributes(global) subroutine naive_transpose_kernel(a, b, rows, cols)
+        real, device, intent(in)  :: a(:,:)
+        real, device, intent(out) :: b(:,:)
+        integer, value, intent(in) :: rows, cols
+        integer :: i, j
+        
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        
+        if (i <= rows .and. j <= cols) then
+            b(j, i) = a(i, j)
+        end if
+    end subroutine naive_transpose_kernel
+
+    subroutine transpose_gpu(a, b, block_dim)
+        real, intent(in)  :: a(:,:)
+        real, intent(out) :: b(:,:)
+        integer, intent(in) :: block_dim
+        real, device, allocatable :: a_d(:,:), b_d(:,:)
+        integer :: rows, cols, istat
+        type(dim3) :: grid, block
+        
+        rows = size(a, 1)
+        cols = size(a, 2)
+        
+        allocate(a_d(rows, cols), b_d(cols, rows), stat=istat)
+        if (istat /= 0) then
+            print *, 'GPU memory allocation error'
+            return
+        end if
+        
+        ! Копируем данные на GPU
+        a_d = a
+        
+        ! Настройка сетки (блоки и потоки)
+        block = dim3(block_dim, block_dim, 1)
+        grid = dim3(ceiling(real(rows)/block_dim), ceiling(real(cols)/block_dim), 1)
+        
+        print *, 'Grid:', grid%x, 'x', grid%y, '  Block:', block%x, 'x', block%y
+        
+        ! Запускаем ядро
+        call naive_transpose_kernel<<<grid, block>>>(a_d, b_d, rows, cols)
+        
+        ! Синхронизация и копирование результата
+        istat = cudaDeviceSynchronize()
+        b = b_d
+        
+        deallocate(a_d, b_d)
+    end subroutine transpose_gpu
+
+end module gpu_transpose
