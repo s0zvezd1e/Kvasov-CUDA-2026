@@ -1,247 +1,315 @@
+! ================================================================
+! МОДУЛЬ ТРАНСПОНИРОВАНИЯ МАТРИЦЫ НА GPU
+! ================================================================
+!
+! СОДЕРЖИТ ДВЕ РЕАЛИЗАЦИИ:
+!   1. naive   - наивное транспонирование (без shared memory)
+!   2. tiled   - блочное транспонирование с shared memory (оптимальное)
+!
+! ОСНОВНЫЕ ПОНЯТИЯ:
+!   - CUDA THREAD (поток)   - один исполнитель на GPU
+!   - CUDA BLOCK (блок)     - группа потоков (у нас 16×16 = 256 потоков)
+!   - CUDA GRID (сетка)     - группа блоков
+!   - SHARED MEMORY         - быстрая память внутри блока
+!   - TILING (блочность)    - разбиение матрицы на блоки для shared memory
+!
+! ================================================================
+
 module mat_transpose_module
     use cudafor
     implicit none
     private
-
-    integer, parameter, public :: TILE_DIM   = 32
-    integer, parameter, public :: BLOCK_ROWS = 8
-
-    public :: gpu_copy_shared_bw
-    public :: gpu_transpose_bank_conflict
-    public :: gpu_transpose_no_conflict
-    public :: gpu_transpose_naive
+    
+    ! ------------------------------------------------------------
+    ! ПУБЛИЧНЫЕ ФУНКЦИИ
+    ! ------------------------------------------------------------
+    public :: mat_transpose_gpu           ! основная (вызывает tiled)
+    public :: mat_transpose_gpu_naive     ! наивная версия
+    public :: mat_transpose_gpu_tiled     ! блочная версия
 
 contains
 
-    attributes(global) subroutine copy_shared_kernel(odata, idata, nx, ny)
-        integer, value    :: nx, ny
-        real, intent(out) :: odata(nx, ny)
-        real, intent(in)  :: idata(nx, ny)
-        real, shared      :: tile(TILE_DIM, TILE_DIM)
-        integer :: x, y, j
-
-        x = (blockIdx%x - 1) * TILE_DIM + threadIdx%x
-        y = (blockIdx%y - 1) * TILE_DIM + threadIdx%y
-
-        do j = 0, TILE_DIM - 1, BLOCK_ROWS
-            tile(threadIdx%x, threadIdx%y + j) = idata(x, y + j)
-        end do
-        call syncthreads()
-
-        do j = 0, TILE_DIM - 1, BLOCK_ROWS
-            odata(x, y + j) = tile(threadIdx%x, threadIdx%y + j)
-        end do
-    end subroutine copy_shared_kernel
-
-    attributes(global) subroutine transpose_bank_conflict_kernel(odata, idata, nx, ny)
-        integer, value    :: nx, ny
-        real, intent(out) :: odata(ny, nx)
-        real, intent(in)  :: idata(nx, ny)
-        real, shared      :: tile(TILE_DIM, TILE_DIM)
-        integer :: x, y, j
-
-        x = (blockIdx%x - 1) * TILE_DIM + threadIdx%x
-        y = (blockIdx%y - 1) * TILE_DIM + threadIdx%y
-
-        do j = 0, TILE_DIM - 1, BLOCK_ROWS
-            tile(threadIdx%x, threadIdx%y + j) = idata(x, y + j)
-        end do
-        call syncthreads()
-
-        x = (blockIdx%y - 1) * TILE_DIM + threadIdx%x
-        y = (blockIdx%x - 1) * TILE_DIM + threadIdx%y
-
-        do j = 0, TILE_DIM - 1, BLOCK_ROWS
-            odata(x, y + j) = tile(threadIdx%y + j, threadIdx%x)
-        end do
-    end subroutine transpose_bank_conflict_kernel
-
-    attributes(global) subroutine transpose_no_conflict_kernel(odata, idata, nx, ny)
-        integer, value    :: nx, ny
-        real, intent(out) :: odata(ny, nx)
-        real, intent(in)  :: idata(nx, ny)
-        real, shared      :: tile(TILE_DIM + 1, TILE_DIM)
-        integer :: x, y, j
-
-        x = (blockIdx%x - 1) * TILE_DIM + threadIdx%x
-        y = (blockIdx%y - 1) * TILE_DIM + threadIdx%y
-
-        do j = 0, TILE_DIM - 1, BLOCK_ROWS
-            tile(threadIdx%x, threadIdx%y + j) = idata(x, y + j)
-        end do
-        call syncthreads()
-
-        x = (blockIdx%y - 1) * TILE_DIM + threadIdx%x
-        y = (blockIdx%x - 1) * TILE_DIM + threadIdx%y
-
-        do j = 0, TILE_DIM - 1, BLOCK_ROWS
-            odata(x, y + j) = tile(threadIdx%y + j, threadIdx%x)
-        end do
-    end subroutine transpose_no_conflict_kernel
-
+    ! ================================================================
+    ! 1. НАИВНОЕ ТРАНСПОНИРОВАНИЕ (БЕЗ SHARED MEMORY)
+    ! ================================================================
+    ! 
+    ! КАК РАБОТАЕТ:
+    !   - Каждый поток обрабатывает ОДИН элемент
+    !   - Поток получает координаты (row, col)
+    !   - Читает a(row, col)
+    !   - Записывает b(col, row) -> транспонирование
+    !
+    ! НЕДОСТАТОК:
+    !   - Потоки читают глобальную память вразброс (некоалесцированно)
+    !   - Медленно на больших матрицах
+    !
+    ! ================================================================
     attributes(global) subroutine mat_transpose_naive_kernel(a, b, rows, cols)
-        real,    intent(in)  :: a(rows, *)
-        real,    intent(out) :: b(cols, *)
+        implicit none
+        
+        ! --------------------------------------------------------
+        ! ПАРАМЕТРЫ ЯДРА
+        ! --------------------------------------------------------
+        ! a(rows, *) - входная матрица (rows строк, cols столбцов)
+        ! b(cols, *) - выходная матрица (cols строк, rows столбцов)
+        ! rows, cols - размеры
+        ! --------------------------------------------------------
+        real,    intent(in)  :: a(rows, *)    ! вход (rows × cols)
+        real,    intent(out) :: b(cols, *)    ! выход (cols × rows)
         integer, value       :: rows, cols
-        integer :: row, col
-
+        
+        integer :: row, col    ! координаты потока
+        
+        ! --------------------------------------------------------
+        ! ВЫЧИСЛЕНИЕ ГЛОБАЛЬНЫХ КООРДИНАТ
+        ! --------------------------------------------------------
+        ! Формула: (номер_блока - 1) * размер_блока + номер_потока_в_блоке
+        ! --------------------------------------------------------
         row = (blockIdx%x - 1) * blockDim%x + threadIdx%x
         col = (blockIdx%y - 1) * blockDim%y + threadIdx%y
-
-        if (row <= rows .and. col <= cols) b(col, row) = a(row, col)
+        
+        ! --------------------------------------------------------
+        ! ПРОВЕРКА ГРАНИЦ (защита от выхода за пределы матрицы)
+        ! --------------------------------------------------------
+        if (row <= rows .and. col <= cols) then
+            ! ТРАНСПОНИРОВАНИЕ: меняем индексы местами
+            b(col, row) = a(row, col)
+        end if
+        
     end subroutine mat_transpose_naive_kernel
 
-    subroutine gpu_copy_shared_bw(a, b, t_ms, num_reps)
-        real,    intent(in)  :: a(:,:)
-        real,    intent(out) :: b(:,:)
-        real,    intent(out) :: t_ms
-        integer, intent(in)  :: num_reps
-        real, device, allocatable :: d_a(:,:), d_b(:,:)
-        type(dim3)      :: grid, block
-        type(cudaEvent) :: ev_start, ev_stop
-        integer         :: nx, ny, i, istat
 
-        nx = size(a, 1);  ny = size(a, 2)
-        allocate(d_a(nx, ny), d_b(nx, ny), stat=istat)
+    ! ================================================================
+    ! 2. БЛОЧНОЕ ТРАНСПОНИРОВАНИЕ С SHARED MEMORY (ОПТИМАЛЬНОЕ)
+    ! ================================================================
+    !
+    ! ЧТО ТАКОЕ TILING (БЛОЧНОСТЬ)?
+    !   - Матрица разбивается на блоки (tiles) размером TILE×TILE
+    !   - Каждый блок загружается в SHARED MEMORY (очень быстрая)
+    !   - Затем из shared memory выполняется транспонирование
+    !
+    ! ПОЧЕМУ ЭТО БЫСТРЕЕ?
+    !   - Загрузка данных в shared memory происходит КОАЛЕСЦИРОВАННО
+    !   - Доступ к shared memory в 2-3 раза быстрее глобальной памяти
+    !   - Данные переиспользуются внутри блока
+    !
+    ! ПАРАМЕТРЫ:
+    !   TILE = 16  - размер блока (16×16 = 256 потоков)
+    !   tile_buf   - shared memory буфер (16×17, +1 для избежания конфликтов)
+    !
+    ! ================================================================
+    attributes(global) subroutine mat_transpose_tiled_kernel(a, b, rows, cols)
+        implicit none
+        
+        integer, parameter    :: TILE = 16           ! размер блока (16×16 потоков)
+        
+        real,    intent(in)   :: a(rows, *)         ! входная матрица на GPU
+        real,    intent(out)  :: b(cols, *)         ! выходная матрица на GPU
+        integer, value        :: rows, cols         ! размеры
+        
+        ! SHARED MEMORY буфер
+        ! Размер: TILE × (TILE+1) - +1 для избежания конфликтов банков (padding)
+        real,    shared       :: tile_buf(TILE, TILE + 1)
+        
+        integer :: tx, ty      ! локальные координаты потока внутри блока
+        integer :: row, col    ! глобальные координаты в исходной матрице
+        integer :: out_row, out_col   ! координаты в транспонированной матрице
+        
+        ! --------------------------------------------------------
+        ! ПОЛУЧАЕМ ЛОКАЛЬНЫЕ КООРДИНАТЫ ПОТОКА ВНУТРИ БЛОКА
+        ! --------------------------------------------------------
+        tx = threadIdx%x        ! от 1 до TILE (1..16)
+        ty = threadIdx%y        ! от 1 до TILE (1..16)
+        
+        ! --------------------------------------------------------
+        ! ВЫЧИСЛЯЕМ ГЛОБАЛЬНЫЕ КООРДИНАТЫ ДЛЯ ИСХОДНОЙ МАТРИЦЫ
+        ! --------------------------------------------------------
+        row = (blockIdx%x - 1) * TILE + tx
+        col = (blockIdx%y - 1) * TILE + ty
+        
+        ! --------------------------------------------------------
+        ! ЗАГРУЗКА ДАННЫХ В SHARED MEMORY
+        ! --------------------------------------------------------
+        if (row <= rows .and. col <= cols) then
+            tile_buf(tx, ty) = a(row, col)      ! сохраняем в shared memory
+        else
+            tile_buf(tx, ty) = 0.0              ! за пределами матрицы -> 0
+        end if
+        
+        call syncthreads()   ! СИНХРОНИЗАЦИЯ: ждём, пока все потоки загрузят данные
+        
+        ! --------------------------------------------------------
+        ! ВЫЧИСЛЯЕМ КООРДИНАТЫ ДЛЯ ТРАНСПОНИРОВАННОЙ МАТРИЦЫ
+        ! --------------------------------------------------------
+        ! Меняем блоки местами и меняем tx/ty местами
+        out_col = (blockIdx%y - 1) * TILE + tx
+        out_row = (blockIdx%x - 1) * TILE + ty
+        
+        ! --------------------------------------------------------
+        ! ЗАПИСЬ РЕЗУЛЬТАТА ИЗ SHARED MEMORY В ГЛОБАЛЬНУЮ ПАМЯТЬ
+        ! --------------------------------------------------------
+        if (out_col <= cols .and. out_row <= rows) then
+            ! Обратите внимание: tile_buf(ty, tx) - меняем tx и ty местами!
+            ! Это и есть транспонирование внутри shared memory
+            b(out_col, out_row) = tile_buf(ty, tx)
+        end if
+        
+    end subroutine mat_transpose_tiled_kernel
+
+
+    ! ================================================================
+    ! ХОСТ-ФУНКЦИЯ ДЛЯ НАИВНОГО ТРАНСПОНИРОВАНИЯ
+    ! ================================================================
+    ! Выполняет:
+    !   1. Выделение памяти на GPU
+    !   2. Копирование данных с CPU на GPU (H2D)
+    !   3. Запуск ядра
+    !   4. Копирование результата обратно (D2H)
+    !   5. Освобождение памяти
+    ! ================================================================
+    subroutine mat_transpose_gpu_naive(a, b, block_dim)
+        implicit none
+        
+        real,    intent(in)           :: a(:,:)           ! исходная матрица (CPU)
+        real,    intent(out)          :: b(:,:)           ! результат (CPU)
+        integer, intent(in), optional :: block_dim        ! размер блока (по умолчанию 16)
+        
+        real,    device, allocatable :: d_a(:,:), d_b(:,:)   ! массивы на GPU
+        type(dim3) :: grid, block                           ! сетка и блок
+        integer    :: rows, cols, bdim, istat               ! размеры и статус
+        
+        ! --------------------------------------------------------
+        ! ОПРЕДЕЛЯЕМ РАЗМЕРЫ
+        ! --------------------------------------------------------
+        rows = size(a, 1)        ! количество строк
+        cols = size(a, 2)        ! количество столбцов
+        
+        ! --------------------------------------------------------
+        ! ВЫБИРАЕМ РАЗМЕР БЛОКА (по умолчанию 16)
+        ! --------------------------------------------------------
+        bdim = 16
+        if (present(block_dim)) bdim = block_dim
+        
+        ! --------------------------------------------------------
+        ! ВЫДЕЛЯЕМ ПАМЯТЬ НА GPU
+        ! --------------------------------------------------------
+        allocate(d_a(rows, cols), d_b(cols, rows), stat=istat)
         if (istat /= 0) then
-            write(*,'(a)') 'Memory allocation error in gpu_copy_shared_bw'
+            write(*,'(a)') 'Memory allocation error in mat_transpose_gpu_naive'
             stop 1
         end if
+        
+        ! --------------------------------------------------------
+        ! КОПИРУЕМ ДАННЫЕ НА GPU (H2D = Host to Device)
+        ! --------------------------------------------------------
         d_a = a
-
-        block = dim3(TILE_DIM, BLOCK_ROWS, 1)
-        grid  = dim3(nx / TILE_DIM, ny / TILE_DIM, 1)
-
-        istat = cudaEventCreate(ev_start)
-        istat = cudaEventCreate(ev_stop)
-
-        call copy_shared_kernel<<<grid, block>>>(d_b, d_a, nx, ny)
-        istat = cudaDeviceSynchronize()
-
-        istat = cudaEventRecord(ev_start, 0)
-        do i = 1, num_reps
-            call copy_shared_kernel<<<grid, block>>>(d_b, d_a, nx, ny)
-        end do
-        istat = cudaEventRecord(ev_stop, 0)
-        istat = cudaEventSynchronize(ev_stop)
-        istat = cudaEventElapsedTime(t_ms, ev_start, ev_stop)
-
+        
+        ! --------------------------------------------------------
+        ! НАСТРАИВАЕМ СЕТКУ И БЛОКИ
+        ! --------------------------------------------------------
+        block = dim3(bdim, bdim, 1)
+        grid  = dim3((rows + bdim - 1) / bdim, (cols + bdim - 1) / bdim, 1)
+        
+        ! --------------------------------------------------------
+        ! ЗАПУСКАЕМ ЯДРО НА GPU
+        ! --------------------------------------------------------
+        call mat_transpose_naive_kernel<<<grid, block>>>(d_a, d_b, rows, cols)
+        
+        ! --------------------------------------------------------
+        ! КОПИРУЕМ РЕЗУЛЬТАТ ОБРАТНО НА CPU (D2H = Device to Host)
+        ! --------------------------------------------------------
         b = d_b
-        istat = cudaEventDestroy(ev_start)
-        istat = cudaEventDestroy(ev_stop)
+        
+        ! --------------------------------------------------------
+        ! ОСВОБОЖДАЕМ ПАМЯТЬ НА GPU
+        ! --------------------------------------------------------
         deallocate(d_a, d_b)
-    end subroutine gpu_copy_shared_bw
+        
+    end subroutine mat_transpose_gpu_naive
 
-    subroutine gpu_transpose_bank_conflict(a, b, t_ms, num_reps)
-        real,    intent(in)  :: a(:,:)
-        real,    intent(out) :: b(:,:)
-        real,    intent(out) :: t_ms
-        integer, intent(in)  :: num_reps
-        real, device, allocatable :: d_a(:,:), d_b(:,:)
-        type(dim3)      :: grid, block
-        type(cudaEvent) :: ev_start, ev_stop
-        integer         :: nx, ny, i, istat
 
-        nx = size(a, 1);  ny = size(a, 2)
-        allocate(d_a(nx, ny), d_b(ny, nx), stat=istat)
+    ! ================================================================
+    ! ХОСТ-ФУНКЦИЯ ДЛЯ БЛОЧНОГО ТРАНСПОНИРОВАНИЯ (С SHARED MEMORY)
+    ! ================================================================
+    ! Это ОПТИМАЛЬНАЯ версия. Использует:
+    !   - TILE = 16 (блок 16×16)
+    !   - shared memory с padding (16×17)
+    !   - коалесцированный доступ
+    ! ================================================================
+    subroutine mat_transpose_gpu_tiled(a, b)
+        implicit none
+        
+        integer, parameter :: TILE = 16             ! размер блока (16×16)
+        
+        real,    intent(in)  :: a(:,:)             ! исходная матрица (CPU)
+        real,    intent(out) :: b(:,:)             ! результат (CPU)
+        
+        real,    device, allocatable :: d_a(:,:), d_b(:,:)   ! массивы на GPU
+        type(dim3) :: grid, block                           ! сетка и блок
+        integer    :: rows, cols, istat                     ! размеры и статус
+        
+        ! --------------------------------------------------------
+        ! ОПРЕДЕЛЯЕМ РАЗМЕРЫ
+        ! --------------------------------------------------------
+        rows = size(a, 1)
+        cols = size(a, 2)
+        
+        ! --------------------------------------------------------
+        ! ВЫДЕЛЯЕМ ПАМЯТЬ НА GPU
+        ! --------------------------------------------------------
+        allocate(d_a(rows, cols), d_b(cols, rows), stat=istat)
+        if (istat /= 0) then
+            write(*,'(a)') 'Memory allocation error in mat_transpose_gpu_tiled'
+            stop 1
+        end if
+        
+        ! --------------------------------------------------------
+        ! КОПИРУЕМ ДАННЫЕ НА GPU
+        ! --------------------------------------------------------
         d_a = a
-
-        block = dim3(TILE_DIM, BLOCK_ROWS, 1)
-        grid  = dim3(nx / TILE_DIM, ny / TILE_DIM, 1)
-
-        istat = cudaEventCreate(ev_start)
-        istat = cudaEventCreate(ev_stop)
-
-        call transpose_bank_conflict_kernel<<<grid, block>>>(d_b, d_a, nx, ny)
-        istat = cudaDeviceSynchronize()
-
-        istat = cudaEventRecord(ev_start, 0)
-        do i = 1, num_reps
-            call transpose_bank_conflict_kernel<<<grid, block>>>(d_b, d_a, nx, ny)
-        end do
-        istat = cudaEventRecord(ev_stop, 0)
-        istat = cudaEventSynchronize(ev_stop)
-        istat = cudaEventElapsedTime(t_ms, ev_start, ev_stop)
-
+        
+        ! --------------------------------------------------------
+        ! НАСТРАИВАЕМ СЕТКУ И БЛОКИ
+        ! --------------------------------------------------------
+        block = dim3(TILE, TILE, 1)
+        grid  = dim3((rows + TILE - 1) / TILE, (cols + TILE - 1) / TILE, 1)
+        
+        ! --------------------------------------------------------
+        ! ЗАПУСКАЕМ ОПТИМИЗИРОВАННОЕ ЯДРО С SHARED MEMORY
+        ! --------------------------------------------------------
+        call mat_transpose_tiled_kernel<<<grid, block>>>(d_a, d_b, rows, cols)
+        
+        ! --------------------------------------------------------
+        ! КОПИРУЕМ РЕЗУЛЬТАТ ОБРАТНО НА CPU
+        ! --------------------------------------------------------
         b = d_b
-        istat = cudaEventDestroy(ev_start)
-        istat = cudaEventDestroy(ev_stop)
+        
+        ! --------------------------------------------------------
+        ! ОСВОБОЖДАЕМ ПАМЯТЬ
+        ! --------------------------------------------------------
         deallocate(d_a, d_b)
-    end subroutine gpu_transpose_bank_conflict
+        
+    end subroutine mat_transpose_gpu_tiled
 
-    subroutine gpu_transpose_no_conflict(a, b, t_ms, num_reps)
-        real,    intent(in)  :: a(:,:)
-        real,    intent(out) :: b(:,:)
-        real,    intent(out) :: t_ms
-        integer, intent(in)  :: num_reps
-        real, device, allocatable :: d_a(:,:), d_b(:,:)
-        type(dim3)      :: grid, block
-        type(cudaEvent) :: ev_start, ev_stop
-        integer         :: nx, ny, i, istat
 
-        nx = size(a, 1);  ny = size(a, 2)
-        allocate(d_a(nx, ny), d_b(ny, nx), stat=istat)
-        d_a = a
-
-        block = dim3(TILE_DIM, BLOCK_ROWS, 1)
-        grid  = dim3(nx / TILE_DIM, ny / TILE_DIM, 1)
-
-        istat = cudaEventCreate(ev_start)
-        istat = cudaEventCreate(ev_stop)
-
-        call transpose_no_conflict_kernel<<<grid, block>>>(d_b, d_a, nx, ny)
-        istat = cudaDeviceSynchronize()
-
-        istat = cudaEventRecord(ev_start, 0)
-        do i = 1, num_reps
-            call transpose_no_conflict_kernel<<<grid, block>>>(d_b, d_a, nx, ny)
-        end do
-        istat = cudaEventRecord(ev_stop, 0)
-        istat = cudaEventSynchronize(ev_stop)
-        istat = cudaEventElapsedTime(t_ms, ev_start, ev_stop)
-
-        b = d_b
-        istat = cudaEventDestroy(ev_start)
-        istat = cudaEventDestroy(ev_stop)
-        deallocate(d_a, d_b)
-    end subroutine gpu_transpose_no_conflict
-
-    subroutine gpu_transpose_naive(a, b, t_ms, num_reps)
-        real,    intent(in)  :: a(:,:)
-        real,    intent(out) :: b(:,:)
-        real,    intent(out) :: t_ms
-        integer, intent(in)  :: num_reps
-        real, device, allocatable :: d_a(:,:), d_b(:,:)
-        type(dim3)      :: grid, block
-        type(cudaEvent) :: ev_start, ev_stop
-        integer         :: nx, ny, i, istat
-        integer, parameter :: BLK = 16
-
-        nx = size(a, 1);  ny = size(a, 2)
-        allocate(d_a(nx, ny), d_b(ny, nx), stat=istat)
-        d_a = a
-
-        block = dim3(BLK, BLK, 1)
-        grid  = dim3((nx + BLK - 1) / BLK, (ny + BLK - 1) / BLK, 1)
-
-        istat = cudaEventCreate(ev_start)
-        istat = cudaEventCreate(ev_stop)
-
-        call mat_transpose_naive_kernel<<<grid, block>>>(d_a, d_b, nx, ny)
-        istat = cudaDeviceSynchronize()
-
-        istat = cudaEventRecord(ev_start, 0)
-        do i = 1, num_reps
-            call mat_transpose_naive_kernel<<<grid, block>>>(d_a, d_b, nx, ny)
-        end do
-        istat = cudaEventRecord(ev_stop, 0)
-        istat = cudaEventSynchronize(ev_stop)
-        istat = cudaEventElapsedTime(t_ms, ev_start, ev_stop)
-
-        b = d_b
-        istat = cudaEventDestroy(ev_start)
-        istat = cudaEventDestroy(ev_stop)
-        deallocate(d_a, d_b)
-    end subroutine gpu_transpose_naive
+    ! ================================================================
+    ! ПУБЛИЧНАЯ ТОЧКА ВХОДА (ПО УМОЛЧАНИЮ ВЫЗЫВАЕТ TILED ВЕРСИЮ)
+    ! ================================================================
+    ! Этот интерфейс оставлен для совместимости с main.f90
+    ! ================================================================
+    subroutine mat_transpose_gpu(a, b, block_dim)
+        implicit none
+        
+        real,    intent(in)           :: a(:,:)
+        real,    intent(out)          :: b(:,:)
+        integer, intent(in), optional :: block_dim
+        
+        ! block_dim не используется в tiled версии, но интерфейс сохранён
+        if (present(block_dim)) continue   ! игнорируем (для совместимости)
+        
+        ! Вызываем оптимизированную tiled версию
+        call mat_transpose_gpu_tiled(a, b)
+        
+    end subroutine mat_transpose_gpu
 
 end module mat_transpose_module
