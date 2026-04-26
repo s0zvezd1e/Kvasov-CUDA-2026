@@ -1,0 +1,190 @@
+module gpu_gemm_module
+    use cudafor
+    implicit none
+    private
+
+    integer, parameter, public :: TILE = 32
+
+    public :: gemm_bad_naive_gpu
+    public :: gemm_good_naive_gpu
+    public :: gemm_tiled_gpu
+    public :: gemm_cublas_gpu
+
+contains
+
+    ! ПЛОХОЙ НАИВНЫЙ
+    attributes(global) subroutine bad_naive_kernel(a, b, c, m, n, k)
+        integer, value, intent(in) :: m, n, k
+        real(8), device, intent(in)  :: a(:,:), b(:,:)
+        real(8), device, intent(out) :: c(:,:)
+        integer :: i, j, p
+        real(8) :: acc
+        
+        i = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        j = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        
+        if (i <= m .and. j <= n) then
+            acc = 0.d0
+            do p = 1, k
+                acc = acc + a(i, p) * b(p, j)
+            end do
+            c(i, j) = acc
+        end if
+    end subroutine
+
+    subroutine gemm_bad_naive_gpu(a, b, c, t_ms, num_reps)
+        real(8), intent(in)  :: a(:,:), b(:,:)
+        real(8), intent(out) :: c(:,:)
+        integer, intent(in)  :: num_reps
+        real,    intent(out) :: t_ms
+        real(8), device, allocatable :: d_a(:,:), d_b(:,:), d_c(:,:)
+        integer :: m, n, k, rep, istat
+        type(dim3) :: grid, block
+        real :: start, finish
+        
+        m = size(a,1); k = size(a,2); n = size(b,2)
+        allocate(d_a(m,k), d_b(k,n), d_c(m,n), stat=istat)
+        d_a = a; d_b = b
+        
+        block = dim3(TILE, TILE, 1)
+        grid = dim3((n+TILE-1)/TILE, (m+TILE-1)/TILE, 1)
+        
+        call cpu_time(start)
+        do rep = 1, num_reps
+            call bad_naive_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
+        end do
+        call cpu_time(finish)
+        t_ms = (finish - start) * 1000.0 / num_reps
+        c = d_c
+        
+        deallocate(d_a, d_b, d_c)
+    end subroutine
+
+    ! ХОРОШИЙ НАИВНЫЙ
+    attributes(global) subroutine good_naive_kernel(a, b, c, m, n, k)
+        integer, value, intent(in) :: m, n, k
+        real(8), device, intent(in)  :: a(:,:), b(:,:)
+        real(8), device, intent(out) :: c(:,:)
+        integer :: i, j, p
+        real(8) :: acc
+        
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        
+        if (i <= m .and. j <= n) then
+            acc = 0.d0
+            do p = 1, k
+                acc = acc + a(i, p) * b(p, j)
+            end do
+            c(i, j) = acc
+        end if
+    end subroutine
+
+    subroutine gemm_good_naive_gpu(a, b, c, t_ms, num_reps)
+        real(8), intent(in)  :: a(:,:), b(:,:)
+        real(8), intent(out) :: c(:,:)
+        integer, intent(in)  :: num_reps
+        real,    intent(out) :: t_ms
+        real(8), device, allocatable :: d_a(:,:), d_b(:,:), d_c(:,:)
+        integer :: m, n, k, rep, istat
+        type(dim3) :: grid, block
+        real :: start, finish
+        
+        m = size(a,1); k = size(a,2); n = size(b,2)
+        allocate(d_a(m,k), d_b(k,n), d_c(m,n), stat=istat)
+        d_a = a; d_b = b
+        
+        block = dim3(TILE, TILE, 1)
+        grid = dim3((m+TILE-1)/TILE, (n+TILE-1)/TILE, 1)
+        
+        call cpu_time(start)
+        do rep = 1, num_reps
+            call good_naive_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
+        end do
+        call cpu_time(finish)
+        t_ms = (finish - start) * 1000.0 / num_reps
+        c = d_c
+        
+        deallocate(d_a, d_b, d_c)
+    end subroutine
+
+    ! БЛОЧНЫЙ (TILED)
+    attributes(global) subroutine tiled_kernel(a, b, c, m, n, k)
+        integer, value, intent(in) :: m, n, k
+        real(8), device, intent(in)  :: a(:,:), b(:,:)
+        real(8), device, intent(out) :: c(:,:)
+        real(8), shared :: as(TILE, TILE), bs(TILE, TILE)
+        integer :: tx, ty, i, j, p, t, kk
+        real(8) :: acc
+        
+        tx = threadIdx%x; ty = threadIdx%y
+        i = (blockIdx%x - 1) * TILE + tx
+        j = (blockIdx%y - 1) * TILE + ty
+        acc = 0.d0
+        
+        do t = 1, k, TILE
+            kk = t + ty - 1
+            if (i <= m .and. kk <= k) then
+                as(tx, ty) = a(i, kk)
+            else
+                as(tx, ty) = 0.d0
+            end if
+            
+            kk = t + tx - 1
+            if (kk <= k .and. j <= n) then
+                bs(tx, ty) = b(kk, j)
+            else
+                bs(tx, ty) = 0.d0
+            end if
+            
+            call syncthreads()
+            
+            do p = 1, TILE
+                acc = acc + as(tx, p) * bs(p, ty)
+            end do
+            
+            call syncthreads()
+        end do
+        
+        if (i <= m .and. j <= n) c(i, j) = acc
+    end subroutine
+
+    subroutine gemm_tiled_gpu(a, b, c, t_ms, num_reps)
+        real(8), intent(in)  :: a(:,:), b(:,:)
+        real(8), intent(out) :: c(:,:)
+        integer, intent(in)  :: num_reps
+        real,    intent(out) :: t_ms
+        real(8), device, allocatable :: d_a(:,:), d_b(:,:), d_c(:,:)
+        integer :: m, n, k, rep, istat
+        type(dim3) :: grid, block
+        real :: start, finish
+        
+        m = size(a,1); k = size(a,2); n = size(b,2)
+        allocate(d_a(m,k), d_b(k,n), d_c(m,n), stat=istat)
+        d_a = a; d_b = b
+        
+        block = dim3(TILE, TILE, 1)
+        grid = dim3((m+TILE-1)/TILE, (n+TILE-1)/TILE, 1)
+        
+        call cpu_time(start)
+        do rep = 1, num_reps
+            call tiled_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
+        end do
+        call cpu_time(finish)
+        t_ms = (finish - start) * 1000.0 / num_reps
+        c = d_c
+        
+        deallocate(d_a, d_b, d_c)
+    end subroutine
+
+    ! CUBLAS (заглушка)
+    subroutine gemm_cublas_gpu(a, b, c, t_ms, num_reps)
+        real(8), intent(in)  :: a(:,:), b(:,:)
+        real(8), intent(out) :: c(:,:)
+        integer, intent(in)  :: num_reps
+        real,    intent(out) :: t_ms
+        t_ms = 0.0
+        print *, "Warning: cuBLAS not available"
+    end subroutine
+
+end module gpu_gemm_module
