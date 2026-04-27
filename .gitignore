@@ -34,3 +34,5 @@ matrix_add_interactive
 *~
 test_cuda
 test_cuda.f90
+.bash_history
+.gitconfig
