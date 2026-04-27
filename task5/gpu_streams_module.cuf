@@ -3,11 +3,8 @@ module gpu_streams_module
     implicit none
     private
     public :: gemm_serial, gemm_concurrent
-
     integer, parameter :: TILE = 32
-
 contains
-
     subroutine cuda_check(istat, msg)
         integer,          intent(in) :: istat
         character(len=*), intent(in) :: msg
@@ -70,6 +67,7 @@ contains
         call gemm_kernel<<<grid, block>>>(d_A, d_B, d_C, M, K, N)
         call cuda_check(cudaDeviceSynchronize(), 'serial kernel')
         h_C = d_C
+
         call cuda_check(cudaEventRecord(ev_stop, 0), 'serial stop')
         call cuda_check(cudaEventSynchronize(ev_stop), 'serial sync')
         call cuda_check(cudaEventElapsedTime(t_ms, ev_start, ev_stop), 'serial elapsed')
