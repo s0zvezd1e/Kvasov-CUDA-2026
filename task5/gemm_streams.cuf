@@ -1,0 +1,289 @@
+module gemm_streams
+    use cudafor
+    use cublas_v2
+    implicit none
+
+contains
+
+    !============================================================
+    ! Проверка выделения памяти
+    !============================================================
+    subroutine check_alloc(status, name)
+        integer, intent(in) :: status
+        character(len=*), intent(in) :: name
+
+        if (status /= 0) then
+            write(*,'(A,A,A,I0)') 'ALLOC ERROR [', name, ']: ', status
+            stop
+        end if
+    end subroutine check_alloc
+
+
+    !============================================================
+    ! Проверка CUDA ошибок
+    !============================================================
+    subroutine check_cuda(status, name)
+        integer, intent(in) :: status
+        character(len=*), intent(in) :: name
+
+        if (status /= cudaSuccess) then
+            write(*,'(A,A,A,I0)') 'CUDA ERROR [', name, ']: ', status
+            stop
+        end if
+    end subroutine check_cuda
+
+
+    !============================================================
+    ! Проверка cuBLAS ошибок
+    !============================================================
+    subroutine check_cublas(status, name)
+        integer, intent(in) :: status
+        character(len=*), intent(in) :: name
+
+        if (status /= CUBLAS_STATUS_SUCCESS) then
+            write(*,'(A,A,A,I0)') 'CUBLAS ERROR [', name, ']: ', status
+            stop
+        end if
+    end subroutine check_cublas
+
+
+    !============================================================
+    ! SERIAL GEMM (1 вызов cuBLAS)
+    !============================================================
+    subroutine gemm_serial(h_A, h_B, h_C, t_ms)
+
+        real(8), intent(in)  :: h_A(:,:), h_B(:,:)
+        real(8), intent(out) :: h_C(:,:)
+        real,    intent(out) :: t_ms
+
+        integer :: M, N, K, istat
+        real(8), parameter :: alpha = 1.d0, beta = 0.d0
+
+        real(8), device, allocatable :: d_A(:,:), d_B(:,:), d_C(:,:)
+        type(cublasHandle) :: handle
+        type(cudaEvent) :: ev_start, ev_stop
+
+        M = size(h_A,1)
+        N = size(h_A,2)
+        K = size(h_B,2)
+
+        allocate(d_A(M,N), stat=istat); call check_alloc(istat,'d_A')
+        allocate(d_B(N,K), stat=istat); call check_alloc(istat,'d_B')
+        allocate(d_C(M,K), stat=istat); call check_alloc(istat,'d_C')
+
+        istat = cublasCreate(handle); call check_cublas(istat,'create')
+        istat = cudaEventCreate(ev_start)
+        istat = cudaEventCreate(ev_stop)
+
+        istat = cudaEventRecord(ev_start,0)
+
+        d_A = h_A
+        d_B = h_B
+
+        istat = cublasDgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N, &
+                               M, K, N, alpha, d_A, M, d_B, N, beta, d_C, M)
+        call check_cublas(istat,'dgemm')
+
+        istat = cudaDeviceSynchronize()
+        call check_cuda(istat,'sync')
+
+        istat = cudaEventRecord(ev_stop,0)
+        istat = cudaEventSynchronize(ev_stop)
+        istat = cudaEventElapsedTime(t_ms, ev_start, ev_stop)
+
+        h_C = d_C
+
+        istat = cublasDestroy(handle)
+        istat = cudaEventDestroy(ev_start)
+        istat = cudaEventDestroy(ev_stop)
+
+        deallocate(d_A,d_B,d_C)
+
+    end subroutine gemm_serial
+
+
+    !============================================================
+    ! CONCURRENT GEMM (streams + partition by columns)
+    !============================================================
+    subroutine gemm_concurrent(h_A, h_B, h_C, nstreams, t_ms)
+
+        real(8), intent(in)  :: h_A(:,:), h_B(:,:)
+        real(8), intent(out) :: h_C(:,:)
+        integer, intent(in)  :: nstreams
+        real, intent(out) :: t_ms
+
+        integer :: M, N, K
+        integer :: i, istream, szpart, shift, szpart_max, istat
+
+        real(8), parameter :: alpha = 1.d0, beta = 0.d0
+
+        real(8), device, allocatable :: d_A(:,:)
+        real(8), device, allocatable, target :: d_B_all(:,:), d_C_all(:,:)
+        real(8), device, pointer :: d_B_ptr(:,:), d_C_ptr(:,:)
+
+        integer(cuda_stream_kind), allocatable :: stream(:)
+        type(cublasHandle), allocatable :: handle(:)
+
+        type(cudaEvent) :: ev_start, ev_stop
+
+        M = size(h_A,1)
+        N = size(h_A,2)
+        K = size(h_B,2)
+
+        szpart_max = (K + nstreams - 1) / nstreams
+
+        allocate(stream(0:nstreams-1), handle(0:nstreams-1), stat=istat)
+        call check_alloc(istat,'streams')
+
+        do i=0,nstreams-1
+            istat = cudaStreamCreate(stream(i))
+            istat = cublasCreate(handle(i))
+            istat = cublasSetStream(handle(i), stream(i))
+        end do
+
+        allocate(d_A(M,N), stat=istat)
+        allocate(d_B_all(N, szpart_max*nstreams), stat=istat)
+        allocate(d_C_all(M, szpart_max*nstreams), stat=istat)
+
+        istat = cudaEventCreate(ev_start)
+        istat = cudaEventCreate(ev_stop)
+
+        d_A = h_A
+
+        istat = cudaEventRecord(ev_start,0)
+
+        do istream=0,nstreams-1
+
+            szpart = K / nstreams
+            if (istream == nstreams-1) szpart = szpart + mod(K,nstreams)
+
+            shift = (K / nstreams) * istream
+
+            d_B_ptr => d_B_all(1:N, istream*szpart_max+1 : istream*szpart_max+szpart)
+            d_C_ptr => d_C_all(1:M, istream*szpart_max+1 : istream*szpart_max+szpart)
+
+            istat = cublasSetVectorAsync(N*szpart, 8, &
+                    h_B(1,shift+1), 1, d_B_ptr(1,1), 1, stream(istream))
+
+            istat = cublasDgemm_v2(handle(istream), CUBLAS_OP_N, CUBLAS_OP_N, &
+                                   M, szpart, N, alpha, &
+                                   d_A, M, d_B_ptr, N, beta, d_C_ptr, M)
+
+            istat = cublasGetVectorAsync(M*szpart, 8, &
+                    d_C_ptr(1,1), 1, h_C(1,shift+1), 1, stream(istream))
+
+        end do
+
+        istat = cudaDeviceSynchronize()
+
+        istat = cudaEventRecord(ev_stop,0)
+        istat = cudaEventSynchronize(ev_stop)
+        istat = cudaEventElapsedTime(t_ms, ev_start, ev_stop)
+
+        do i=0,nstreams-1
+            istat = cublasDestroy(handle(i))
+            istat = cudaStreamDestroy(stream(i))
+        end do
+
+        istat = cudaEventDestroy(ev_start)
+        istat = cudaEventDestroy(ev_stop)
+
+        deallocate(stream,handle,d_A,d_B_all,d_C_all)
+
+    end subroutine gemm_concurrent
+
+
+    !============================================================
+    ! COPY ONLY (memory benchmark)
+    !============================================================
+    subroutine gemm_copy_only(h_A, h_B, t_ms)
+
+        real(8), intent(inout) :: h_A(:,:), h_B(:,:)
+        real, intent(out) :: t_ms
+
+        real(8), device, allocatable :: d_A(:,:), d_B(:,:)
+        integer :: M,N,K,istat
+        type(cudaEvent) :: ev_start, ev_stop
+
+        M=size(h_A,1)
+        N=size(h_A,2)
+        K=size(h_B,2)
+
+        allocate(d_A(M,N), stat=istat)
+        allocate(d_B(N,K), stat=istat)
+
+        istat = cudaEventCreate(ev_start)
+        istat = cudaEventCreate(ev_stop)
+
+        istat = cudaEventRecord(ev_start,0)
+
+        d_A = h_A
+        d_B = h_B
+
+        istat = cudaDeviceSynchronize()
+
+        h_A = d_A
+        h_B = d_B
+
+        istat = cudaDeviceSynchronize()
+
+        istat = cudaEventRecord(ev_stop,0)
+        istat = cudaEventSynchronize(ev_stop)
+        istat = cudaEventElapsedTime(t_ms, ev_start, ev_stop)
+
+        istat = cudaEventDestroy(ev_start)
+        istat = cudaEventDestroy(ev_stop)
+
+        deallocate(d_A,d_B)
+
+    end subroutine gemm_copy_only
+
+end module gemm_streams
+
+
+!============================================================
+! MAIN
+!============================================================
+program dgemm_streams
+
+    use cudafor
+    use cublas_v2
+    use gemm_streams
+    implicit none
+
+    integer, parameter :: M=512, N=512, K_large=4096, NSTREAMS=4
+
+    real(8), allocatable :: h_A(:,:), h_B(:,:), h_Cs(:,:), h_Cc(:,:)
+    real :: t_s,t_c,t_cp
+    real(8) :: flops, speedup
+
+    integer :: istat
+
+    allocate(h_A(M,N),h_B(N,K_large),h_Cs(M,K_large),h_Cc(M,K_large))
+
+    call random_number(h_A)
+    call random_number(h_B)
+
+    flops = 2.d0*M*N*K_large
+
+    call gemm_serial(h_A,h_B,h_Cs,t_s)
+    call gemm_concurrent(h_A,h_B,h_Cc,NSTREAMS,t_c)
+    call gemm_copy_only(h_A,h_B,t_cp)
+
+    speedup = t_s/t_c
+
+    write(*,'(A)') '=============================================================='
+    write(*,'(A25,4X,A10,4X,A)') 'Routine','ms','GFLOP/s'
+    write(*,'(A)') '--------------------------------------------------------------'
+    write(*,'(A25,4X,F8.2,4X,F10.3)') 'Serial',t_s,flops/(t_s*1.d-3)/1.d9
+    write(*,'(A25,4X,F8.2,4X,F10.3)') 'Concurrent',t_c,flops/(t_c*1.d-3)/1.d9
+    write(*,'(A25,4X,F8.2,4X,A)') 'Copy-only',t_cp,'---'
+    write(*,'(A)') '--------------------------------------------------------------'
+    write(*,'(A25,4X,F8.2,A)') 'Speedup',speedup,'x'
+    write(*,'(A)') '=============================================================='
+
+    write(*,'(A,ES11.3)') 'max|serial - concurrent| = ',maxval(abs(h_Cs-h_Cc))
+
+    deallocate(h_A,h_B,h_Cs,h_Cc)
+
+end program dgemm_streams
