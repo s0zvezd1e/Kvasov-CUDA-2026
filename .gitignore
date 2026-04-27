@@ -32,3 +32,5 @@ matrix_add_interactive
 # Временные файлы
 *.swp
 *~
+test_cuda
+test_cuda.f90
