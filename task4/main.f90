@@ -5,9 +5,9 @@ program main
     use gpu_gemm_module
     implicit none
 
-    integer, parameter :: N = 512
+    integer, parameter :: N        = 1024
     integer, parameter :: NUM_REPS = 5
-    integer, parameter :: NBYTES = 8
+    integer, parameter :: NBYTES   = 8
 
     real(8), allocatable :: a(:,:), b(:,:)
     real(8), allocatable :: c_cpu(:,:)
@@ -32,38 +32,42 @@ program main
 
     allocate(a(N,N), b(N,N), c_cpu(N,N), &
              c_bad(N,N), c_good(N,N), c_tiled(N,N), c_cublas(N,N), stat=istat)
+    if (istat /= 0) stop 'Memory allocation error'
+
     call rnd_fill(a)
     call rnd_fill(b)
 
     flops = 2.d0 * dble(N) * dble(N) * dble(N)
     bytes_min = dble(N*N + N*N + N*N) * dble(NBYTES)
 
-    ! CPU замер
     call cpu_time(t0)
     call matmul_cpu(a, b, c_cpu)
     call cpu_time(t1)
-    t_cpu = (t1 - t0)
+    t_cpu = t1 - t0
 
-    ! GPU методы
-    call gemm_bad_naive_gpu (a, b, c_bad,    t_bad_ms,    NUM_REPS)
-    call gemm_good_naive_gpu(a, b, c_good,   t_good_ms,   NUM_REPS)
-    call gemm_tiled_gpu     (a, b, c_tiled,  t_tiled_ms,  NUM_REPS)
+    call gemm_bad_naive_gpu(a, b, c_bad, t_bad_ms, NUM_REPS)
+    call gemm_good_naive_gpu(a, b, c_good, t_good_ms, NUM_REPS)
+    call gemm_tiled_gpu(a, b, c_tiled, t_tiled_ms, NUM_REPS)
 
     write(*,'(a)') '==================================================================='
     write(*,'(a36,2x,a10,2x,a8,2x,a10)') 'Routine', 'ms/call', 'GFLOPS', 'BW (GB/s)'
     write(*,'(a)') '-------------------------------------------------------------------'
+    
     call print_row('CPU matmul (Fortran)',    t_cpu*1000.0, flops, bytes_min, peak_bw)
+    
     write(*,'(a)') '-------------------------------------------------------------------'
-    call print_row_ms('GPU naive (bad access)',  t_bad_ms,    NUM_REPS, flops, bytes_min, peak_bw)
-    call print_row_ms('GPU naive (good access)', t_good_ms,   NUM_REPS, flops, bytes_min, peak_bw)
-    call print_row_ms('GPU tiled (TILE=32)',     t_tiled_ms,  NUM_REPS, flops, bytes_min, peak_bw)
+    
+    call print_row_ms('GPU naive (bad access)',   t_bad_ms,    NUM_REPS, flops, bytes_min, peak_bw)
+    call print_row_ms('GPU naive (good access)',  t_good_ms,   NUM_REPS, flops, bytes_min, peak_bw)
+    call print_row_ms('GPU tiled (shared memory)', t_tiled_ms,  NUM_REPS, flops, bytes_min, peak_bw)
+    
     write(*,'(a)') '==================================================================='
     write(*,*)
 
     write(*,'(a)') '--- Correctness (max |result - CPU| ) ---'
-    write(*,'(a,es11.3)') 'GPU naive bad     : ', max_abs_diff(c_bad,     c_cpu)
-    write(*,'(a,es11.3)') 'GPU naive good    : ', max_abs_diff(c_good,    c_cpu)
-    write(*,'(a,es11.3)') 'GPU tiled         : ', max_abs_diff(c_tiled,   c_cpu)
+    write(*,'(a,es11.3)') 'GPU naive (bad)      : ', max_abs_diff(c_bad,    c_cpu)
+    write(*,'(a,es11.3)') 'GPU naive (good)     : ', max_abs_diff(c_good,   c_cpu)
+    write(*,'(a,es11.3)') 'GPU tiled            : ', max_abs_diff(c_tiled,  c_cpu)
 
     deallocate(a, b, c_cpu, c_bad, c_good, c_tiled, c_cublas)
 
@@ -75,8 +79,8 @@ contains
         real(8) :: gflops, bw
         gflops = fl / (t_ms * 1.d-3) / 1.d9
         bw     = byt / (t_ms * 1.d-3) / 1.d9
-        write(*,'(a36,2x,f10.6,2x,f8.3,2x,f10.2)') name, t_ms, gflops, bw
-    end subroutine print_row
+        write(*,'(a36,2x,f8.2,2x,f8.3,2x,f10.2)') name, t_ms, gflops, bw
+    end subroutine
 
     subroutine print_row_ms(name, t_total_ms, nr, fl, byt, pk)
         character(*), intent(in) :: name
@@ -87,7 +91,7 @@ contains
         t_avg_ms = dble(t_total_ms) / dble(nr)
         gflops   = fl / (t_avg_ms * 1.d-3) / 1.d9
         bw       = byt / (t_avg_ms * 1.d-3) / 1.d9
-        write(*,'(a36,2x,f10.6,2x,f8.3,2x,f10.2)') name, t_avg_ms, gflops, bw
-    end subroutine print_row_ms
+        write(*,'(a36,2x,f8.2,2x,f8.3,2x,f10.2)') name, t_avg_ms, gflops, bw
+    end subroutine
 
 end program main

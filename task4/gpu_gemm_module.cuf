@@ -12,17 +12,20 @@ module gpu_gemm_module
 
 contains
 
-    ! ПЛОХОЙ НАИВНЫЙ
-    attributes(global) subroutine bad_naive_kernel(a, b, c, m, n, k)
-        integer, value, intent(in) :: m, n, k
+    ! ============================================================
+    ! 1. ПЛОХОЙ НАИВНЫЙ МЕТОД
+    ! ============================================================
+    
+    attributes(global) subroutine gemm_bad_naive_kernel(a, b, c, m, n, k)
+        integer, value   :: m, n, k
         real(8), device, intent(in)  :: a(:,:), b(:,:)
         real(8), device, intent(out) :: c(:,:)
         integer :: i, j, p
         real(8) :: acc
-        
+
         i = (blockIdx%y - 1) * blockDim%y + threadIdx%y
         j = (blockIdx%x - 1) * blockDim%x + threadIdx%x
-        
+
         if (i <= m .and. j <= n) then
             acc = 0.d0
             do p = 1, k
@@ -44,6 +47,7 @@ contains
         
         m = size(a,1); k = size(a,2); n = size(b,2)
         allocate(d_a(m,k), d_b(k,n), d_c(m,n), stat=istat)
+        if (istat /= 0) return
         d_a = a; d_b = b
         
         block = dim3(TILE, TILE, 1)
@@ -51,7 +55,7 @@ contains
         
         call cpu_time(start)
         do rep = 1, num_reps
-            call bad_naive_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
+            call gemm_bad_naive_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
         end do
         call cpu_time(finish)
         t_ms = (finish - start) * 1000.0 / num_reps
@@ -60,17 +64,21 @@ contains
         deallocate(d_a, d_b, d_c)
     end subroutine
 
-    ! ХОРОШИЙ НАИВНЫЙ
-    attributes(global) subroutine good_naive_kernel(a, b, c, m, n, k)
-        integer, value, intent(in) :: m, n, k
+
+    ! ============================================================
+    ! 2. ХОРОШИЙ НАИВНЫЙ МЕТОД
+    ! ============================================================
+    
+    attributes(global) subroutine gemm_good_naive_kernel(a, b, c, m, n, k)
+        integer, value   :: m, n, k
         real(8), device, intent(in)  :: a(:,:), b(:,:)
         real(8), device, intent(out) :: c(:,:)
         integer :: i, j, p
         real(8) :: acc
-        
+
         i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
         j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
-        
+
         if (i <= m .and. j <= n) then
             acc = 0.d0
             do p = 1, k
@@ -92,6 +100,7 @@ contains
         
         m = size(a,1); k = size(a,2); n = size(b,2)
         allocate(d_a(m,k), d_b(k,n), d_c(m,n), stat=istat)
+        if (istat /= 0) return
         d_a = a; d_b = b
         
         block = dim3(TILE, TILE, 1)
@@ -99,7 +108,7 @@ contains
         
         call cpu_time(start)
         do rep = 1, num_reps
-            call good_naive_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
+            call gemm_good_naive_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
         end do
         call cpu_time(finish)
         t_ms = (finish - start) * 1000.0 / num_reps
@@ -108,16 +117,21 @@ contains
         deallocate(d_a, d_b, d_c)
     end subroutine
 
-    ! БЛОЧНЫЙ (TILED)
-    attributes(global) subroutine tiled_kernel(a, b, c, m, n, k)
-        integer, value, intent(in) :: m, n, k
+
+    ! ============================================================
+    ! 3. БЛОЧНЫЙ МЕТОД (TILED) С SHARED MEMORY
+    ! ============================================================
+    
+    attributes(global) subroutine gemm_tiled_kernel(a, b, c, m, n, k)
+        integer, value   :: m, n, k
         real(8), device, intent(in)  :: a(:,:), b(:,:)
         real(8), device, intent(out) :: c(:,:)
         real(8), shared :: as(TILE, TILE), bs(TILE, TILE)
         integer :: tx, ty, i, j, p, t, kk
         real(8) :: acc
         
-        tx = threadIdx%x; ty = threadIdx%y
+        tx = threadIdx%x
+        ty = threadIdx%y
         i = (blockIdx%x - 1) * TILE + tx
         j = (blockIdx%y - 1) * TILE + ty
         acc = 0.d0
@@ -146,7 +160,9 @@ contains
             call syncthreads()
         end do
         
-        if (i <= m .and. j <= n) c(i, j) = acc
+        if (i <= m .and. j <= n) then
+            c(i, j) = acc
+        end if
     end subroutine
 
     subroutine gemm_tiled_gpu(a, b, c, t_ms, num_reps)
@@ -161,6 +177,7 @@ contains
         
         m = size(a,1); k = size(a,2); n = size(b,2)
         allocate(d_a(m,k), d_b(k,n), d_c(m,n), stat=istat)
+        if (istat /= 0) return
         d_a = a; d_b = b
         
         block = dim3(TILE, TILE, 1)
@@ -168,7 +185,7 @@ contains
         
         call cpu_time(start)
         do rep = 1, num_reps
-            call tiled_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
+            call gemm_tiled_kernel<<<grid, block>>>(d_a, d_b, d_c, m, n, k)
         end do
         call cpu_time(finish)
         t_ms = (finish - start) * 1000.0 / num_reps
@@ -177,14 +194,18 @@ contains
         deallocate(d_a, d_b, d_c)
     end subroutine
 
-    ! CUBLAS (заглушка)
+
+    ! ============================================================
+    ! 4. CUBLAS (заглушка - не используется)
+    ! ============================================================
+    
     subroutine gemm_cublas_gpu(a, b, c, t_ms, num_reps)
         real(8), intent(in)  :: a(:,:), b(:,:)
         real(8), intent(out) :: c(:,:)
         integer, intent(in)  :: num_reps
         real,    intent(out) :: t_ms
         t_ms = 0.0
-        print *, "Warning: cuBLAS not available"
+        print *, "Warning: cuBLAS not available, using stub"
     end subroutine
 
 end module gpu_gemm_module
