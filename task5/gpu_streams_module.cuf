@@ -1,31 +1,94 @@
 module gpu_streams_module
+
+    ! Подключаем библиотеку CUDA Fortran.
+    ! Она даёт: device-массивы, атрибуты ядер (global),
+    ! типы cudaEvent / dim3, функции cudaMemcpy и т.д.
     use cudafor
     implicit none
+
+    ! Все имена модуля по умолчанию скрыты снаружи (private).
+    ! Наружу видны только две подпрограммы ниже.
     private
     public :: gemm_serial, gemm_concurrent
+
+    ! Размер стороны блока потоков (thread block).
+    ! Один блок = TILE x TILE = 32 x 32 = 1024 потока.
+    ! Это максимум для большинства современных GPU (Compute Capability >= 2.0).
+    ! Каждый поток в блоке будет считать ОДИН элемент матрицы C.
     integer, parameter :: TILE = 32
+
 contains
+
+    ! =========================================================
+    ! cuda_check - вспомогательная процедура проверки ошибок
+    ! =========================================================
+    ! Почти каждая CUDA-функция возвращает целочисленный код:
+    !   0 (cudaSuccess) - всё хорошо
+    !   любое другое   - ошибка
+    ! Вместо того чтобы проверять код вручную каждый раз,
+    ! мы оборачиваем вызов в эту процедуру.
+    ! При ошибке она печатает сообщение и завершает программу.
+    ! =========================================================
     subroutine cuda_check(istat, msg)
         integer,          intent(in) :: istat
         character(len=*), intent(in) :: msg
         if (istat /= cudaSuccess) then
-            write(*,'(a,a,a,i0)') '[CUDA ERROR] ', msg, ' code=', istat
+            write(*,'(a,a,a,i0)') 'CUDA ERROR: ', msg, ' code=', istat
             stop 1
         end if
     end subroutine cuda_check
 
+
+    ! =========================================================
+    ! gemm_kernel - ядро умножения матриц (выполняется на GPU)
+    ! =========================================================
+    ! attributes(global) означает: эта подпрограмма запускается
+    ! с CPU, но каждый поток GPU выполняет её независимо.
+    !
+    ! ЗАДАЧА ЯДРА: вычислить C = A * B
+    !   A имеет размер (m x k)
+    !   B имеет размер (k x n)
+    !   C имеет размер (m x n)
+    !
+    ! РАСПРЕДЕЛЕНИЕ РАБОТЫ ПО ПОТОКАМ:
+    !   Матрица C делится на прямоугольники TILE x TILE.
+    !   Каждый прямоугольник обрабатывает один thread block.
+    !   Внутри блока каждый поток считает ровно один элемент C(i,j).
+    !
+    !   Глобальный индекс строки i и столбца j вычисляется так:
+    !     i = (номер блока по X - 1) * ширина блока + номер потока по X
+    !     j = (номер блока по Y - 1) * высота блока + номер потока по Y
+    !
+    ! ПОЧЕМУ "value" у m, n, k:
+    !   Скалярные аргументы ядра обязаны передаваться по значению,
+    !   иначе GPU не сможет их прочитать (они живут на CPU, не на GPU).
+    !
+    ! ПОЧЕМУ "device" у a, b, c:
+    !   Эти массивы находятся в видеопамяти GPU.
+    !   Без атрибута device компилятор решит, что они на CPU.
+    ! =========================================================
     attributes(global) subroutine gemm_kernel(a, b, c, m, n, k)
-        integer, value, intent(in) :: m, n, k
+        integer, value, intent(in)   :: m, n, k
         real(8), device, intent(in)  :: a(m,k), b(k,n)
         real(8), device, intent(out) :: c(m,n)
+
         integer :: i, j, p
         real(8) :: acc
-        
+
+        ! Вычисляем, какой элемент C(i,j) считает этот поток.
+        ! blockIdx, blockDim, threadIdx - встроенные переменные CUDA.
+        ! В Fortran обращаемся к их полям через %.
         i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
         j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
-        
+
+        ! Крайние блоки сетки могут выйти за границу матрицы,
+        ! если M или N не кратны TILE. Проверяем границы.
         if (i <= m .and. j <= n) then
             acc = 0.d0
+            ! Наивное скалярное произведение строки A(i,:) на столбец B(:,j).
+            ! "Наивное" - потому что каждый поток читает данные из глобальной
+            ! памяти GPU напрямую, без использования быстрой shared memory.
+            ! Это проще для понимания, но медленнее оптимизированных версий.
             do p = 1, k
                 acc = acc + a(i, p) * b(p, j)
             end do
@@ -33,129 +96,262 @@ contains
         end if
     end subroutine gemm_kernel
 
-    ! Последовательная версия - просто умножаем всё сразу
+
+    ! =========================================================
+    ! gemm_serial - последовательная версия умножения
+    ! =========================================================
+    ! Стратегия: копируем всё на GPU одним куском, запускаем
+    ! одно ядро, копируем результат обратно.
+    !
+    ! Параметр nstreams принимается для совместимости интерфейса
+    ! с gemm_concurrent, но здесь НЕ используется.
+    !
+    ! ИЗМЕРЕНИЕ ВРЕМЕНИ через cudaEvent:
+    !   GPU работает асинхронно с CPU, поэтому cpu_time() ненадёжен.
+    !   cudaEvent - это временная метка прямо на шкале GPU.
+    !   Разность двух меток (start / stop) даёт точное время GPU в мс.
+    ! =========================================================
     subroutine gemm_serial(h_A, h_B, h_C, nstreams, t_ms)
-        real(8), intent(in)    :: h_A(:,:)
-        real(8), intent(in)    :: h_B(:,:)
-        real(8), intent(out)   :: h_C(:,:)
-        integer, intent(in)    :: nstreams
-        real,    intent(out)   :: t_ms
+
+        ! Префикс h_ означает "host" - массив на оперативной памяти CPU.
+        real(8), intent(in)  :: h_A(:,:)
+        real(8), intent(in)  :: h_B(:,:)
+        real(8), intent(out) :: h_C(:,:)
+        integer, intent(in)  :: nstreams
+        real,    intent(out) :: t_ms
 
         integer :: M, N, K
+
+        ! Префикс d_ означает "device" - массив в видеопамяти GPU.
+        ! "device, allocatable" - динамический массив на GPU.
         real(8), device, allocatable :: d_A(:,:), d_B(:,:), d_C(:,:)
+
+        ! dim3 - трёхмерный тип для описания геометрии запуска ядра.
+        ! block - сколько потоков в одном блоке (TILE x TILE x 1).
+        ! grid  - сколько блоков в сетке (по X, по Y, по Z).
         type(dim3) :: grid, block
+
+        ! cudaEvent - объект временной метки на GPU.
         type(cudaEvent) :: ev_start, ev_stop
+
         integer :: istat
 
-        M = size(h_A, 1)
-        N = size(h_A, 2)
-        K = size(h_B, 2)
+        ! Читаем реальные размеры из переданных массивов.
+        M = size(h_A, 1)   ! строк в A
+        N = size(h_A, 2)   ! столбцов в A = строк в B
+        K = size(h_B, 2)   ! столбцов в B = столбцов в C
 
+        ! Выделяем память в видеопамяти GPU под все три матрицы.
         allocate(d_A(M, N), d_B(N, K), d_C(M, K), stat=istat)
         if (istat /= 0) stop 'serial: allocation failed'
 
+        ! Настраиваем геометрию запуска.
+        ! block: каждый блок содержит TILE*TILE потоков (в 2D).
+        ! grid:  нужно столько блоков, чтобы покрыть всю матрицу C.
+        !        Формула ceil(X / TILE) = (X + TILE - 1) / TILE.
         block = dim3(TILE, TILE, 1)
-        grid = dim3((M+TILE-1)/TILE, (K+TILE-1)/TILE, 1)
+        grid  = dim3((M + TILE - 1) / TILE, (K + TILE - 1) / TILE, 1)
 
+        ! Создаём объекты событий для замера времени.
         call cuda_check(cudaEventCreate(ev_start), 'serial ev_start')
-        call cuda_check(cudaEventCreate(ev_stop), 'serial ev_stop')
+        call cuda_check(cudaEventCreate(ev_stop),  'serial ev_stop')
 
+        ! H2D (Host to Device): копируем матрицы A и B на GPU.
+        ! В CUDA Fortran простое присваивание d_X = h_X автоматически
+        ! вызывает cudaMemcpy из оперативной памяти в видеопамять.
         d_A = h_A
         d_B = h_B
 
+        ! Фиксируем стартовую метку времени на GPU.
+        ! Второй аргумент 0 означает "default stream".
         call cuda_check(cudaEventRecord(ev_start, 0), 'serial start')
+
+        ! Запускаем ядро. Синтаксис CUDA Fortran:
+        !   имя_ядра<<<grid, block>>>(аргументы)
+        ! Ядро запускается АСИНХРОННО: CPU не ждёт его завершения.
         call gemm_kernel<<<grid, block>>>(d_A, d_B, d_C, M, K, N)
+
+        ! Блокируем CPU до полного завершения всех задач на GPU.
         call cuda_check(cudaDeviceSynchronize(), 'serial kernel')
+
+        ! D2H (Device to Host): копируем результат C обратно на CPU.
         h_C = d_C
 
-        call cuda_check(cudaEventRecord(ev_stop, 0), 'serial stop')
-        call cuda_check(cudaEventSynchronize(ev_stop), 'serial sync')
+        ! Фиксируем стоп-метку и вычисляем прошедшее время.
+        call cuda_check(cudaEventRecord(ev_stop, 0),           'serial stop')
+        call cuda_check(cudaEventSynchronize(ev_stop),         'serial sync')
         call cuda_check(cudaEventElapsedTime(t_ms, ev_start, ev_stop), 'serial elapsed')
 
+        ! Освобождаем ресурсы GPU.
         call cuda_check(cudaEventDestroy(ev_start), 'serial destroy start')
-        call cuda_check(cudaEventDestroy(ev_stop), 'serial destroy stop')
+        call cuda_check(cudaEventDestroy(ev_stop),  'serial destroy stop')
         deallocate(d_A, d_B, d_C)
+
     end subroutine gemm_serial
 
-    ! Конкурентная версия - разбиваем B по столбцам, каждый поток (stream) работает со своей частью
+
+    ! =========================================================
+    ! gemm_concurrent - конкурентная версия умножения
+    ! =========================================================
+    ! Стратегия: делим матрицу B на nstreams вертикальных полос.
+    ! Каждая полоса обрабатывается в отдельном CUDA stream.
+    !
+    ! Что такое CUDA stream:
+    !   Stream - это очередь команд GPU, выполняемых строго по порядку.
+    !   Команды из РАЗНЫХ streams могут выполняться ОДНОВРЕМЕННО,
+    !   если хватает ресурсов GPU (SM, DMA-движки копирования).
+    !
+    ! Схема для nstreams=4, K=4096, N=512, M=512:
+    !
+    !   B (512 x 4096):
+    !   | полоса 0 | полоса 1 | полоса 2 | полоса 3 |
+    !     1024 ст.   1024 ст.   1024 ст.   1024 ст.
+    !
+    !   stream 0: [копия B0] -> [ядро C0] -> [копия C0]
+    !   stream 1:      [копия B1] -> [ядро C1] -> [копия C1]
+    !   stream 2:           [копия B2] -> [ядро C2] -> [копия C2]
+    !   stream 3:                [копия B3] -> [ядро C3] -> [копия C3]
+    !
+    ! За счёт перекрытия операций суммарное время должно быть меньше.
+    !
+    ! ПРИМЕЧАНИЕ: d_B и d_C здесь ОБЩИЕ буферы для всех streams.
+    ! Это значит, что мы не можем по-настоящему запустить все streams
+    ! одновременно - каждый stream должен дождаться предыдущего,
+    ! пока тот освободит буферы. Для истинного параллелизма нужен
+    ! отдельный буфер d_B / d_C на каждый stream (d_B_all и d_C_all).
+    ! Текущая реализация проще и хорошо иллюстрирует принцип.
+    ! =========================================================
     subroutine gemm_concurrent(h_A, h_B, h_C, nstreams, t_ms)
-        real(8), intent(in)    :: h_A(:,:)
-        real(8), intent(in)    :: h_B(:,:)
-        real(8), intent(out)   :: h_C(:,:)
-        integer, intent(in)    :: nstreams
-        real,    intent(out)   :: t_ms
+
+        real(8), intent(in)  :: h_A(:,:)
+        real(8), intent(in)  :: h_B(:,:)
+        real(8), intent(out) :: h_C(:,:)
+        integer, intent(in)  :: nstreams
+        real,    intent(out) :: t_ms
 
         integer :: M, N, K
-        integer :: istream, szpart, shift
+        integer :: istream   ! Счётчик текущего stream в цикле
+        integer :: szpart    ! Ширина текущей полосы B (число столбцов)
+        integer :: shift     ! Смещение начала полосы в исходной B
+        integer :: szpart_max  ! Максимальная ширина полосы (для буферов)
+        integer :: istat
+
+        ! cuda_stream_kind - целочисленный тип CUDA Fortran для хэндлов streams.
+        ! Хэндл - это идентификатор ресурса GPU (аналог FILE* в C).
         integer(cuda_stream_kind), allocatable :: stream(:)
+
+        ! d_A - вся матрица A, общая для всех streams (только читается).
         real(8), device, allocatable :: d_A(:,:)
-        real(8), device, allocatable :: d_B(:,:), d_C(:,:)
-        type(dim3) :: grid, block
+
+        ! d_B и d_C - рабочие буферы размером под одну полосу.
+        ! Каждая итерация цикла использует их по очереди.
+        real(8), device, allocatable :: d_B(:,:)
+        real(8), device, allocatable :: d_C(:,:)
+
+        type(dim3)      :: grid, block
         type(cudaEvent) :: ev_start, ev_stop
-        integer :: szpart_max, istat
 
         M = size(h_A, 1)
         N = size(h_A, 2)
         K = size(h_B, 2)
+
+        ! Максимальная ширина полосы - нужна для выделения буфера.
+        ! Используем ceil-деление, чтобы последняя полоса всегда вмещалась.
+        ! Пример: K=4100, nstreams=4 -> szpart_max = (4100+3)/4 = 1025
         szpart_max = (K + nstreams - 1) / nstreams
 
+        ! Выделяем массив хэндлов для всех streams (индексы 0..nstreams-1).
         allocate(stream(0:nstreams-1), stat=istat)
         if (istat /= 0) stop 'concurrent: stream allocation failed'
 
+        ! Создаём CUDA streams. Каждый cudaStreamCreate выделяет
+        ! очередь команд на GPU и записывает её хэндл в stream(i).
         do istream = 0, nstreams - 1
             call cuda_check(cudaStreamCreate(stream(istream)), 'streamCreate')
         end do
 
+        ! Выделяем видеопамять: A, и буферы под одну полосу B и C.
         allocate(d_A(M, N), stat=istat)
         if (istat /= 0) stop 'concurrent: d_A allocation failed'
+
         allocate(d_B(N, szpart_max), stat=istat)
         if (istat /= 0) stop 'concurrent: d_B allocation failed'
+
         allocate(d_C(M, szpart_max), stat=istat)
         if (istat /= 0) stop 'concurrent: d_C allocation failed'
 
+        ! Геометрия ядра рассчитана на максимальный размер полосы.
         block = dim3(TILE, TILE, 1)
-        grid = dim3((M+TILE-1)/TILE, (szpart_max+TILE-1)/TILE, 1)
+        grid  = dim3((M          + TILE - 1) / TILE, &
+                     (szpart_max + TILE - 1) / TILE, &
+                     1)
 
         call cuda_check(cudaEventCreate(ev_start), 'concurrent ev_start')
-        call cuda_check(cudaEventCreate(ev_stop), 'concurrent ev_stop')
+        call cuda_check(cudaEventCreate(ev_stop),  'concurrent ev_stop')
 
-        ! Копируем A (общая для всех)
+        ! Матрица A нужна всем полосам - копируем один раз до цикла.
+        ! cudaDeviceSynchronize гарантирует, что копия завершена
+        ! до того, как любой stream начнёт читать d_A.
         d_A = h_A
         call cuda_check(cudaDeviceSynchronize(), 'concurrent A copy')
 
+        ! Ставим временную метку старта в default stream.
         call cuda_check(cudaEventRecord(ev_start, 0), 'concurrent start')
 
+        ! Цикл по полосам: каждая итерация отправляет работу в свой stream.
         do istream = 0, nstreams - 1
+
+            ! Ширина текущей полосы.
+            ! Все полосы одинаковы кроме последней: она получает остаток.
             szpart = K / nstreams
             if (istream == nstreams - 1) szpart = szpart + mod(K, nstreams)
+
+            ! Столбец в матрице B, с которого начинается текущая полоса.
             shift = (K / nstreams) * istream
 
-            ! Копируем свою часть B
+            ! H2D: копируем нужные столбцы B в GPU-буфер d_B.
+            ! Fortran-срез h_B(1:N, shift+1 : shift+szpart) выбирает
+            ! szpart столбцов начиная со столбца shift+1.
             d_B(1:N, 1:szpart) = h_B(1:N, shift+1 : shift+szpart)
+
+            ! Ждём, пока этот stream завершит все свои предыдущие задачи
+            ! (в т.ч. копию B) перед запуском ядра.
             call cuda_check(cudaStreamSynchronize(stream(istream)), 'B copy sync')
 
-            ! Запускаем ядро в своём потоке
-            call gemm_kernel<<<grid, block, 0, stream(istream)>>>(d_A, d_B, d_C, M, szpart, N)
+            ! Запускаем ядро в конкретном stream.
+            ! Четвёртый параметр в <<< >>> - хэндл stream'а.
+            ! Третий параметр (0) - байты динамической shared memory (не нужны).
+            call gemm_kernel<<<grid, block, 0, stream(istream)>>>( &
+                d_A, d_B, d_C, M, szpart, N)
 
-            ! Копируем результат обратно
+            ! D2H: копируем результат этой полосы обратно на CPU.
             h_C(1:M, shift+1 : shift+szpart) = d_C(1:M, 1:szpart)
+
+            ! Ждём завершения stream'а перед следующей итерацией.
+            ! Это важно: следующая итерация перезапишет d_B и d_C,
+            ! поэтому текущий stream должен полностью завершиться.
             call cuda_check(cudaStreamSynchronize(stream(istream)), 'result copy sync')
+
         end do
 
+        ! Финальная синхронизация: убеждаемся, что все GPU-операции завершены.
         call cuda_check(cudaDeviceSynchronize(), 'concurrent sync')
 
-        call cuda_check(cudaEventRecord(ev_stop, 0), 'concurrent stop')
-        call cuda_check(cudaEventSynchronize(ev_stop), 'concurrent sync')
+        ! Фиксируем стоп-метку и вычисляем общее время.
+        call cuda_check(cudaEventRecord(ev_stop, 0),           'concurrent stop')
+        call cuda_check(cudaEventSynchronize(ev_stop),         'concurrent sync')
         call cuda_check(cudaEventElapsedTime(t_ms, ev_start, ev_stop), 'concurrent elapsed')
 
+        ! Освобождаем все GPU-ресурсы: события, streams, массивы.
         call cuda_check(cudaEventDestroy(ev_start), 'concurrent destroy start')
-        call cuda_check(cudaEventDestroy(ev_stop), 'concurrent destroy stop')
+        call cuda_check(cudaEventDestroy(ev_stop),  'concurrent destroy stop')
 
         do istream = 0, nstreams - 1
             call cuda_check(cudaStreamDestroy(stream(istream)), 'streamDestroy')
         end do
 
         deallocate(stream, d_A, d_B, d_C)
+
     end subroutine gemm_concurrent
 
 end module gpu_streams_module
